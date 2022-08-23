@@ -17,7 +17,6 @@ var (
 	pubFile = flag.String("pubFile", "key.pub", "TPM public key File")
 	keyFile = flag.String("keyFile", "key.priv", "TPM KeyFile")
 	parent  = flag.Int("parent", int(tpm2.HandleOwner), "key parent object ID")
-	tpmPath = flag.String("tpm-path", "/dev/tpm0", "Path to the TPM device (character device or a Unix socket).")
 )
 
 func main() {
