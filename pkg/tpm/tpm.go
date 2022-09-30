@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"github.com/google/go-tpm-tools/client"
 	"io"
 	"os"
 	"sync"
@@ -31,8 +32,10 @@ var (
 type TPM struct {
 	crypto.Signer
 
-	TpmHandleFile      string
-	TpmHandle          uint32
+	Tss           *TSS
+	TpmHandleFile string
+	TpmHandle     uint32
+
 	TpmDevice          string
 	SignatureAlgorithm x509.SignatureAlgorithm
 	refreshMutex       sync.Mutex
@@ -57,20 +60,21 @@ func NewTPMCrypto(conf *TPM) (TPM, error) {
 	}
 	defer rwc.Close()
 
-	// for _, handleType := range handleNames["all"] {
-	// 	handles, err := client.Handles(rwc, handleType)
-	// 	if err != nil {
-	// 		return TPM{}, fmt.Errorf("error getting handles")
-	// 	}
-	// 	for _, handle := range handles {
-	// 		if err = tpm2.FlushContext(rwc, handle); err != nil {
-	// 			return TPM{}, fmt.Errorf("error flushing 0x%x: %v", handle, err)
-	// 		}
-	// 	}
-	// }
+	// cleanup transient data from TPM
+	for _, handleType := range handleNames["all"] {
+		handles, err := client.Handles(rwc, handleType)
+		if err != nil {
+			return TPM{}, fmt.Errorf("error getting handles")
+		}
+		for _, handle := range handles {
+			if err = tpm2.FlushContext(rwc, handle); err != nil {
+				return TPM{}, fmt.Errorf("error flushing 0x%x: %v", handle, err)
+			}
+		}
+	}
 
-	if conf.TpmHandleFile == "" && conf.TpmHandle == 0 {
-		return TPM{}, fmt.Errorf("at most one of TpmHandle or TpmHandleFile must be specified")
+	if conf.TpmHandleFile == "" && conf.TpmHandle == 0 && conf.Tss == nil {
+		return TPM{}, fmt.Errorf("at most one of key handler must be specified")
 	}
 	if conf.ExtTLSConfig != nil {
 		if len(conf.ExtTLSConfig.Certificates) > 0 {
@@ -97,10 +101,15 @@ func (t TPM) Public() crypto.PublicKey {
 			fmt.Printf(": Public: Unable to Open TPM: %v\n", err)
 			return nil
 		}
-		defer tpm2.FlushContext(rwc, kh)
 		defer rwc.Close()
 
-		if t.TpmHandleFile != "" {
+		if t.Tss != nil {
+			kh, err = t.Tss.LoadKey(rwc)
+			if err != nil {
+				fmt.Printf("public: TSS key load error: %v\n", err)
+				return nil
+			}
+		} else if t.TpmHandleFile != "" {
 			khBytes, err := os.ReadFile(t.TpmHandleFile)
 			if err != nil {
 				fmt.Printf("public1: ContextLoad read file for kh: %v\n", err)
@@ -117,6 +126,7 @@ func (t TPM) Public() crypto.PublicKey {
 			fmt.Println("public: both tpmHandlefile and tpmhandle are null")
 			return nil
 		}
+		defer tpm2.FlushContext(rwc, kh)
 
 		pub, _, _, err := tpm2.ReadPublic(rwc, kh)
 		if err != nil {
@@ -146,23 +156,32 @@ func (t TPM) Sign(rr io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, 
 	if err != nil {
 		return []byte(""), fmt.Errorf("google: Public: Unable to Open TPM: %v", err)
 	}
-	defer tpm2.FlushContext(rwc, kh)
 	defer rwc.Close()
 
-	if t.TpmHandleFile != "" {
+	if t.Tss != nil {
+		kh, err = t.Tss.LoadKey(rwc)
+		if err != nil {
+			fmt.Printf("public: TSS key load error: %v\n", err)
+			return []byte(""), fmt.Errorf("sign: TSS key load error: %v\n", err)
+		}
+	} else if t.TpmHandleFile != "" {
 		khBytes, err := os.ReadFile(t.TpmHandleFile)
 		if err != nil {
 			fmt.Printf("sign: ContextLoad read file for kh: %v\n", err)
-			return []byte(""), fmt.Errorf(" Public: ContextLoad read file for kh: %v", err)
+			return []byte(""), fmt.Errorf(" sign: ContextLoad read file for kh: %v", err)
 		}
 		kh, err = tpm2.ContextLoad(rwc, khBytes)
 		if err != nil {
 			fmt.Printf("sign: ContextLoad read file for kh: %v\n", err)
-			return []byte(""), fmt.Errorf("Public: ContextLoad read file for kh:: %v", err)
+			return []byte(""), fmt.Errorf("sign: ContextLoad read file for kh:: %v", err)
 		}
 	} else if t.TpmHandle != 0 {
 		kh = tpmutil.Handle(t.TpmHandle)
+	} else {
+		fmt.Println("sign: both tpmHandlefile and tpmhandle are null")
+		return []byte(""), fmt.Errorf("sign: both tpmHandlefile and tpmhandle are null")
 	}
+	defer tpm2.FlushContext(rwc, kh)
 	var signed *tpm2.Signature
 
 	if t.SignatureAlgorithm == x509.SHA256WithRSA {
@@ -210,7 +229,8 @@ func (t TPM) TLSCertificate() tls.Certificate {
 	}
 
 	x509Certificate = *pub
-	var privKey crypto.PrivateKey = t
+	var privKey crypto.PrivateKey
+	privKey = t
 	return tls.Certificate{
 		PrivateKey:  privKey,
 		Leaf:        &x509Certificate,

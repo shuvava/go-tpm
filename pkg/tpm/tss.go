@@ -1,11 +1,61 @@
 package tpm
 
 import (
+	"bytes"
 	"encoding/asn1"
+	"encoding/pem"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 
+	"github.com/google/go-tpm-tools/client"
+	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpmutil"
+)
+
+const defaultPassword = ""
+
+var (
+	pcrSelection = tpm2.PCRSelection{Hash: tpm2.AlgSHA256, PCRs: []int{}}
+
+	defaultPrimaryRSATemplate = tpm2.Public{
+		Type:       tpm2.AlgRSA,
+		NameAlg:    tpm2.AlgSHA256,
+		Attributes: tpm2.FlagFixedTPM | tpm2.FlagFixedParent | tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth | tpm2.FlagNoDA | tpm2.FlagRestricted | tpm2.FlagDecrypt,
+		AuthPolicy: nil,
+		RSAParameters: &tpm2.RSAParams{
+			Symmetric: &tpm2.SymScheme{
+				Alg:     tpm2.AlgAES,
+				KeyBits: 128,
+				Mode:    tpm2.AlgCFB,
+			},
+			Sign: &tpm2.SigScheme{
+				Alg: tpm2.AlgNull,
+			},
+			KeyBits:     2048,
+			ExponentRaw: 0,
+			ModulusRaw:  make([]byte, 256),
+		},
+	}
+
+	defaultPrimaryECCTemplate = tpm2.Public{
+		Type:       tpm2.AlgECC,
+		NameAlg:    tpm2.AlgSHA256,
+		Attributes: tpm2.FlagFixedTPM | tpm2.FlagFixedParent | tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth | tpm2.FlagNoDA | tpm2.FlagRestricted | tpm2.FlagDecrypt,
+		AuthPolicy: nil,
+		ECCParameters: &tpm2.ECCParams{
+			CurveID: tpm2.CurveNISTP256,
+			KDF: &tpm2.KDFScheme{
+				Alg: tpm2.AlgNull,
+			},
+			Symmetric: &tpm2.SymScheme{
+				Alg:     tpm2.AlgAES,
+				KeyBits: 128,
+				Mode:    tpm2.AlgCFB,
+			},
+		},
+	}
 )
 
 // TSS OpenSSL TMP access key format
@@ -112,4 +162,85 @@ func (msg *TSS) Marshal() (b []byte, err error) {
 	raw.Bytes = append(raw.Bytes, buf...)
 
 	return asn1.Marshal(raw)
+}
+
+func decode(p []byte) ([]byte, error) {
+	a := make([]byte, len(p))
+	copy(a, p)
+	tpmPubBlob := tpmutil.U16Bytes(a)
+	bufTest := bytes.NewBuffer(tpmPubBlob)
+	err := tpmPubBlob.TPMUnmarshal(bufTest)
+	if err != nil {
+		return nil, fmt.Errorf("decoding error: %v", err)
+	}
+	return tpmPubBlob, nil
+}
+
+// DecodePublic converts byte array into tpm2.Public structure
+func (msg *TSS) DecodePublic() (*tpm2.Public, error) {
+	tpmPubBlob, err := decode(msg.Public)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := tpm2.DecodePublic(tpmPubBlob)
+
+	return &pub, err
+}
+
+func (msg *TSS) loadPrimary(rw io.ReadWriter) (tpmutil.Handle, error) {
+	if msg.Parent != 0 && msg.Parent != tpm2.HandleOwner {
+		key, err := client.NewCachedKey(rw, tpm2.HandleOwner, defaultPrimaryECCTemplate, msg.Parent)
+		if err != nil {
+			return 0, err
+		}
+		return key.Handle(), nil
+	}
+	pkh, _, err := tpm2.CreatePrimary(rw, tpm2.HandleOwner, pcrSelection, defaultPassword, defaultPassword, defaultPrimaryECCTemplate)
+	if err != nil {
+		return 0, fmt.Errorf("error on creating primary key: %v", err)
+	}
+	return pkh, nil
+}
+
+// LoadKey load TSS 2.0 key into transient TPM memory
+// caller should execute tpm2.FlushContext for returned handle
+func (msg *TSS) LoadKey(rw io.ReadWriter) (tpmutil.Handle, error) {
+	publicBlob, err := decode(msg.Public)
+	if err != nil {
+		return 0, err
+	}
+	privateBlob, err := decode(msg.Private)
+	if err != nil {
+		return 0, err
+	}
+	primaryHandle, err := msg.loadPrimary(rw)
+	if err != nil {
+		return 0, err
+	}
+	defer func(rw io.ReadWriter, handle tpmutil.Handle) {
+		_ = tpm2.FlushContext(rw, primaryHandle)
+	}(rw, primaryHandle)
+	keyHandle, _, err := tpm2.Load(rw, primaryHandle, "", publicBlob, privateBlob)
+	if err != nil {
+		return 0, fmt.Errorf("load key error: %v\n", err)
+	}
+	return keyHandle, nil
+}
+
+// LoadFromFile loads TSS2 pem encoded file into TSS struct
+func LoadFromFile(f string) (*TSS, error) {
+	b, err := os.ReadFile(f)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(b)
+	if block.Type != "TSS2 PRIVATE KEY" {
+		return nil, fmt.Errorf("failed to find corrent block type")
+	}
+	msg := &TSS{}
+	rest, err := msg.Unmarshal(block.Bytes)
+	if len(rest) > 0 {
+		return nil, fmt.Errorf("unexpected block size")
+	}
+	return msg, nil
 }
